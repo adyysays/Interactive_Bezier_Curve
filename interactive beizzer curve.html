@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Interactive Bézier Rope (Canvas)</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0f172a;color:#e6eef8;font-family:Inter,ui-sans-serif,system-ui}
+    #ui{position:fixed;left:12px;top:12px;background:rgba(255,255,255,0.04);backdrop-filter:blur(6px);padding:10px;border-radius:8px;z-index:10}
+    #ui label{display:block;font-size:12px;margin:6px 0 2px;color:#cbd5e1}
+    #ui input[type=range]{width:200px}
+    canvas{display:block;width:100vw;height:100vh}
+    #hint{position:fixed;left:12px;bottom:12px;font-size:13px;opacity:0.9}
+    .small{font-size:12px;color:#94a3b8}
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <div style="font-weight:600;margin-bottom:6px">Bézier Rope — Controls</div>
+    <label>Stiffness (k) <span id="kVal" class="small">0.25</span></label>
+    <input id="k" type="range" min="0.01" max="1.2" step="0.01" value="0.25">
+    <label>Damping <span id="dVal" class="small">0.12</span></label>
+    <input id="d" type="range" min="0" max="0.6" step="0.005" value="0.12">
+    <label>Tangent density (every N samples) <span id="tangentVal" class="small">10</span></label>
+    <input id="tangentDensity" type="range" min="2" max="50" step="1" value="10">
+    <div style="margin-top:8px" class="small">Click & drag <strong>P1</strong> or <strong>P2</strong>. Move mouse/touch to push rope.</div>
+  </div>
+
+  <canvas id="c"></canvas>
+  <div id="hint" class="small">FPS: <span id="fps">--</span></div>
+
+  <script>
+    // ---------- Utilities: 2D vector ops ----------
+    function v(x=0,y=0){return {x:x,y:y}}
+    function add(a,b){return {x:a.x+b.x,y:a.y+b.y}}
+    function sub(a,b){return {x:a.x-b.x,y:a.y-b.y}}
+    function mul(a,s){return {x:a.x*s,y:a.y*s}}
+    function len(a){return Math.hypot(a.x||0,a.y||0)}
+    function norm(a){let L=len(a); return L? mul(a,1/L) : {x:0,y:0}}
+
+    // ---------- Canvas setup ----------
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('2d');
+    let W=0,H=0;
+    function resize(){
+      const dpr = window.devicePixelRatio || 1;
+      W = Math.floor(window.innerWidth);
+      H = Math.floor(window.innerHeight);
+      canvas.style.width = W + 'px';
+      canvas.style.height = H + 'px';
+      canvas.width = Math.floor(W * dpr);
+      canvas.height = Math.floor(H * dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+    }
+    window.addEventListener('resize', () => { resize(); placeDefaults(); });
+    resize();
+
+    // ---------- Control points + physics state ----------
+    // Index mapping: P0=0, P1=1 (dynamic), P2=2 (dynamic), P3=3
+    const p0Index = 0, p1Index = 1, p2Index = 2, p3Index = 3;
+    const P = [v(80, H/2), v(W/3, H/2), v(2*W/3, H/2), v(W-80, H/2)];
+
+    // Physics state for dynamic points (P1, P2)
+    const state = {};
+    function placeDefaults(){
+      P[p0Index] = v(80, H/2);
+      P[p3Index] = v(W-80, H/2);
+      P[p1Index] = v(Math.floor(W/3), Math.floor(H/2));
+      P[p2Index] = v(Math.floor(2*W/3), Math.floor(H/2));
+
+      state[p1Index] = { pos: {x:P[p1Index].x, y:P[p1Index].y}, vel: v(0,0), target: {x:P[p1Index].x, y:P[p1Index].y} };
+      state[p2Index] = { pos: {x:P[p2Index].x, y:P[p2Index].y}, vel: v(0,0), target: {x:P[p2Index].x, y:P[p2Index].y} };
+    }
+    placeDefaults();
+
+    // initial parameters
+    let params = {k:0.25, damping:0.12, tStep:0.01, tangentEvery:10, tangentLen:24};
+
+    // Smooth mouse target
+    const mouse = {x:W/2, y:H/2, active:false};
+
+    // Interaction: drag points (only dynamic P1 or P2)
+    let dragging = null; // index or null
+
+    function screenToCanvas(e){
+      const rect = canvas.getBoundingClientRect();
+      return {x: (e.clientX - rect.left), y: (e.clientY - rect.top)};
+    }
+
+    // Mouse / touch handlers
+    canvas.addEventListener('mousemove', (e)=>{
+      const pos = screenToCanvas(e);
+      mouse.x = pos.x; mouse.y = pos.y; mouse.active = true;
+      if(dragging!==null){
+        // dragging is guaranteed to be dynamic index (p1 or p2)
+        const s = state[dragging];
+        if(s){ s.pos.x = pos.x; s.pos.y = pos.y; s.vel = v(0,0); P[dragging] = {x:pos.x, y:pos.y}; }
+      }
+    });
+    canvas.addEventListener('mouseleave', ()=> { mouse.active=false; });
+
+    canvas.addEventListener('mousedown', (e)=>{
+      const p = screenToCanvas(e);
+      // allow dragging only for dynamic control points (p1,p2)
+      const r = 14;
+      const dynamic = [p1Index, p2Index];
+      for(let idx of dynamic){
+        const pt = state[idx] ? state[idx].pos : P[idx];
+        if(Math.hypot(pt.x-p.x, pt.y-p.y) <= r){
+          dragging = idx;
+          return;
+        }
+      }
+    });
+    window.addEventListener('mouseup', ()=>{ dragging = null; });
+
+    // touch
+    canvas.addEventListener('touchmove', (ev)=>{
+      ev.preventDefault();
+      const t = ev.touches[0];
+      const rect = canvas.getBoundingClientRect();
+      mouse.x = t.clientX - rect.left; mouse.y = t.clientY - rect.top; mouse.active = true;
+      if(dragging!==null){ const s = state[dragging]; if(s){ s.pos.x = mouse.x; s.pos.y = mouse.y; s.vel = v(0,0); P[dragging] = {x:mouse.x,y:mouse.y}; } }
+    }, {passive:false});
+    canvas.addEventListener('touchstart', (ev)=>{
+      ev.preventDefault();
+      const t = ev.touches[0];
+      const rect = canvas.getBoundingClientRect();
+      const p = {x: t.clientX-rect.left, y: t.clientY-rect.top};
+      const r = 14;
+      const dynamic = [p1Index,p2Index];
+      for(let idx of dynamic){
+        const pt = state[idx] ? state[idx].pos : P[idx];
+        if(Math.hypot(pt.x-p.x, pt.y-p.y) <= r){ dragging = idx; return; }
+      }
+    }, {passive:false});
+    window.addEventListener('touchend', ()=>{ dragging=null; });
+
+    // UI bindings
+    const kRange = document.getElementById('k');
+    const dRange = document.getElementById('d');
+    const tangentRange = document.getElementById('tangentDensity');
+    const kVal = document.getElementById('kVal');
+    const dVal = document.getElementById('dVal');
+    const tangentVal = document.getElementById('tangentVal');
+
+    kRange.addEventListener('input', ()=>{ params.k = parseFloat(kRange.value); kVal.textContent = params.k.toFixed(2); });
+    dRange.addEventListener('input', ()=>{ params.damping = parseFloat(dRange.value); dVal.textContent = params.damping.toFixed(2); });
+    tangentRange.addEventListener('input', ()=>{ params.tangentEvery = parseInt(tangentRange.value); tangentVal.textContent = params.tangentEvery; });
+
+    // ---------- Bézier math ----------
+    function bezierPoint(t, P0, P1, P2, P3){
+      const u = 1-t;
+      const u3 = u*u*u, u2 = u*u, t2 = t*t, t3 = t*t*t;
+      return {
+        x: u3*P0.x + 3*u2*t*P1.x + 3*u*t2*P2.x + t3*P3.x,
+        y: u3*P0.y + 3*u2*t*P1.y + 3*u*t2*P2.y + t3*P3.y
+      };
+    }
+    function bezierTangent(t, P0, P1, P2, P3){
+      const u = 1-t;
+      // B'(t) = 3(1−t)²(P1−P0) + 6(1−t)t(P2−P1) + 3t²(P3−P2)
+      const a = mul(sub(P1,P0), 3*u*u);
+      const b = mul(sub(P2,P1), 6*u*t);
+      const c = mul(sub(P3,P2), 3*t*t);
+      return add(add(a,b),c);
+    }
+
+    // ---------- Physics integration ----------
+    let last = performance.now();
+    let fpsCounter = {frames:0, last:performance.now(), fps:0};
+
+    function step(){
+      const now = performance.now();
+      let dt = (now - last) / 1000; // seconds
+      if(dt > 0.04) dt = 0.04; // clamp large dt
+      last = now;
+
+      // update target positions for p1 and p2 based on mouse
+      if(mouse.active){
+        state[p1Index].target.x = mouse.x - 40;
+        state[p1Index].target.y = mouse.y - 10;
+        state[p2Index].target.x = mouse.x + 40;
+        state[p2Index].target.y = mouse.y + 10;
+      } else {
+        // relax towards default positions near center
+        state[p1Index].target.x = W/3; state[p1Index].target.y = H/2;
+        state[p2Index].target.x = 2*W/3; state[p2Index].target.y = H/2;
+      }
+
+      // integrate physics for dynamic points
+      [p1Index,p2Index].forEach(i=>{
+        const s = state[i];
+        if(!s) return;
+        // compute spring acceleration: -k*(pos-target) - damping*vel
+        const disp = sub(s.pos, s.target); // pos - target
+        const spring = mul(disp, -params.k); // -k*(pos-target)
+        const damp = mul(s.vel, -params.damping);
+        const acc = add(spring, damp);
+        // semi-implicit Euler (better stability): v += a*dt; pos += v*dt
+        s.vel.x += acc.x * dt;
+        s.vel.y += acc.y * dt;
+        s.pos.x += s.vel.x * dt;
+        s.pos.y += s.vel.y * dt;
+
+        // reflect into P used for rendering
+        P[i].x = s.pos.x; P[i].y = s.pos.y;
+      });
+
+      // FPS
+      fpsCounter.frames++;
+      if(now - fpsCounter.last >= 500){ fpsCounter.fps = Math.round((fpsCounter.frames*1000)/(now-fpsCounter.last)); fpsCounter.last = now; fpsCounter.frames = 0; document.getElementById('fps').textContent = fpsCounter.fps; }
+    }
+
+    // ---------- Rendering ----------
+    function draw(){
+      ctx.clearRect(0,0,W,H);
+
+      // background subtle gradient
+      const g = ctx.createLinearGradient(0,0,0,H);
+      g.addColorStop(0, '#071029'); g.addColorStop(1, '#071229');
+      ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+      // draw control polygon
+      ctx.beginPath();
+      ctx.moveTo(P[p0Index].x, P[p0Index].y);
+      ctx.lineTo(P[p1Index].x, P[p1Index].y);
+      ctx.lineTo(P[p2Index].x, P[p2Index].y);
+      ctx.lineTo(P[p3Index].x, P[p3Index].y);
+      ctx.strokeStyle = 'rgba(148,163,184,0.12)'; ctx.lineWidth = 1; ctx.stroke();
+
+      // draw bezier curve
+      ctx.beginPath();
+      const tStep = params.tStep;
+      const P0 = P[p0Index], P1 = P[p1Index], P2 = P[p2Index], P3 = P[p3Index];
+      let first = true; let idx=0;
+      for(let t=0; t<=1+1e-9; t+=tStep){
+        const pt = bezierPoint(t,P0,P1,P2,P3);
+        if(first){ ctx.moveTo(pt.x, pt.y); first=false; }
+        else ctx.lineTo(pt.x, pt.y);
+        // tangents
+        if(idx % params.tangentEvery === 0){
+          const tan = bezierTangent(t,P0,P1,P2,P3);
+          const tn = norm(tan);
+          const tx = pt.x + tn.x * params.tangentLen;
+          const ty = pt.y + tn.y * params.tangentLen;
+          ctx.beginPath(); ctx.moveTo(pt.x, pt.y); ctx.lineTo(tx, ty);
+          ctx.strokeStyle = 'rgba(99,102,241,0.75)'; ctx.lineWidth = 1.2; ctx.stroke();
+        }
+        idx++;
+      }
+      ctx.strokeStyle = '#60a5fa'; ctx.lineWidth = 3; ctx.stroke();
+
+      // draw control points
+      const drawCP = (pt, color) => {
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, 8, 0, Math.PI*2);
+        ctx.fillStyle = color; ctx.fill();
+        ctx.beginPath(); ctx.arc(pt.x, pt.y, 18, 0, Math.PI*2);
+        ctx.strokeStyle = 'rgba(96,165,250,0.06)'; ctx.lineWidth = 2; ctx.stroke();
+      }
+      drawCP(P[p0Index], '#7dd3fc');
+      drawCP(P[p3Index], '#7dd3fc');
+      drawCP(P[p1Index], '#60a5fa');
+      drawCP(P[p2Index], '#60a5fa');
+
+      // labels
+      ctx.fillStyle = '#cbd5e1'; ctx.font = '12px system-ui';
+      ctx.fillText('P0', P[p0Index].x-18, P[p0Index].y-12);
+      ctx.fillText('P1', P[p1Index].x-18, P[p1Index].y-12);
+      ctx.fillText('P2', P[p2Index].x+10, P[p2Index].y-12);
+      ctx.fillText('P3', P[p3Index].x+10, P[p3Index].y-12);
+
+      // draw target markers for debugging (only if state exists)
+      if(state[p1Index]){ ctx.beginPath(); ctx.arc(state[p1Index].target.x, state[p1Index].target.y, 4,0,Math.PI*2); ctx.fillStyle='rgba(99,102,241,0.2)'; ctx.fill(); }
+      if(state[p2Index]){ ctx.beginPath(); ctx.arc(state[p2Index].target.x, state[p2Index].target.y, 4,0,Math.PI*2); ctx.fillStyle='rgba(99,102,241,0.2)'; ctx.fill(); }
+    }
+
+    // ---------- Main loop ----------
+    function loop(){ step(); draw(); requestAnimationFrame(loop); }
+    requestAnimationFrame(()=>{ last = performance.now(); loop(); });
+
+    // small helper: enable double-click to reset dynamic points
+    canvas.addEventListener('dblclick', ()=>{
+      state[p1Index].pos = v(Math.floor(W/3), Math.floor(H/2)); state[p2Index].pos = v(Math.floor(2*W/3), Math.floor(H/2));
+      state[p1Index].vel = v(0,0); state[p2Index].vel = v(0,0);
+      P[p1Index] = {x:state[p1Index].pos.x, y:state[p1Index].pos.y}; P[p2Index] = {x:state[p2Index].pos.x, y:state[p2Index].pos.y};
+    });
+
+    // initialize values in UI
+    kVal.textContent = params.k.toFixed(2); dVal.textContent = params.damping.toFixed(2); tangentVal.textContent = params.tangentEvery;
+
+  </script>
+</body>
+</html>
+
